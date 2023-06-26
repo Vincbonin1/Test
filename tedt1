@@ -1,0 +1,889 @@
+using Kruger.KruPlanner.Common.Data;
+using Kruger.KruPlanner.Common.Helpers;
+using Kruger.KruPlanner.Connector.SQLServer;
+using Kruger.KruPlanner.Data;
+using Kruger.KruPlanner.Services.UserServicesReference;
+using System;
+using System.Collections.Generic;
+using System.Linq;
+
+namespace Kruger.KruPlanner.Services.Processes
+{
+    internal static class KpiReportGen
+    {
+        public static KpiReportData Generate(string siteGroupId, DateTime date, IList<string> roleFilter, ISqlServerConnector dataConnector, UserServicesClient userServices)
+        {
+            SiteGroup siteGroup = userServices.GetSiteGroupById(siteGroupId);
+            WeeklySchedule weeklySchedule = dataConnector.GetWeeklySchedule(siteGroupId, date);
+            IList<OrderConfirmation> confirmations = dataConnector.GetOrderConfirmations(siteGroupId, weeklySchedule.WeekStart, weeklySchedule.WeekEnd);
+
+            IEnumerable<WeeklyScheduleDetail> details = weeklySchedule.WeeklyScheduleDetails;
+            IEnumerable<WorkOperation> mondayScheduleFilter = dataConnector.GetDailyOperations(siteGroupId, weeklySchedule.WeekStart);
+            IEnumerable<WorkOperation> tuesdayScheduleFilter = dataConnector.GetDailyOperations(siteGroupId, weeklySchedule.WeekStart.AddDays(1));
+            IEnumerable<WorkOperation> wednesdayScheduleFilter = dataConnector.GetDailyOperations(siteGroupId, weeklySchedule.WeekStart.AddDays(2));
+            IEnumerable<WorkOperation> thursdayScheduleFilter = dataConnector.GetDailyOperations(siteGroupId, weeklySchedule.WeekStart.AddDays(3));
+            IEnumerable<WorkOperation> fridayScheduleFilter = dataConnector.GetDailyOperations(siteGroupId, weeklySchedule.WeekStart.AddDays(4));
+
+            // Filter by roles
+            if (roleFilter != null && roleFilter.Count > 0)
+            {
+                details = weeklySchedule.WeeklyScheduleDetails.Where(wsd => roleFilter.Contains(wsd.Operation.WorkCenter.RoleId));
+                mondayScheduleFilter = mondayScheduleFilter.Where(s => roleFilter.Contains(s.RoleId));
+                tuesdayScheduleFilter = tuesdayScheduleFilter.Where(s => roleFilter.Contains(s.RoleId));
+                wednesdayScheduleFilter = wednesdayScheduleFilter.Where(s => roleFilter.Contains(s.RoleId));
+                thursdayScheduleFilter = thursdayScheduleFilter.Where(s => roleFilter.Contains(s.RoleId));
+                fridayScheduleFilter = fridayScheduleFilter.Where(s => roleFilter.Contains(s.RoleId));
+            }
+
+            KpiReportData report = new KpiReportData();
+
+            report.WeekStart = DateHelper.GetWeekBeginning(date);
+            // For KPI, week is monday to friday
+            report.WeekEnd = DateHelper.GetWeekEnding(date).AddDays(-2);
+
+            KpiReportWeekColumn columnData;
+            List<KpiReportWeekColumn> columnsForTotal = new List<KpiReportWeekColumn>();
+
+            // Proactives
+            columnData = GenerateWeeklyColumn("PRO-IMPR", GetProactiveImprovements(details), confirmations, report.WeekEnd);
+            columnsForTotal.Add(columnData);
+            report.WeeklyColumns.Add(columnData);
+            columnData = GenerateWeeklyColumn("PRO-PRCO", GetProactivePrevCorrections(details), confirmations, report.WeekEnd);
+            columnsForTotal.Add(columnData);
+            report.WeeklyColumns.Add(columnData);
+            columnData = GenerateWeeklyColumn("PRO-PREV", GetProactivePreventives(details), confirmations, report.WeekEnd);
+            columnsForTotal.Add(columnData);
+            report.WeeklyColumns.Add(columnData);
+            columnData = GenerateWeeklyColumn("PRO-SECU", GetProactiveSecurity(details), confirmations, report.WeekEnd);
+            columnsForTotal.Add(columnData);
+            report.WeeklyColumns.Add(columnData);
+            columnData = GenerateWeeklyColumn("PRO-FORM", GetProactiveFormations(details), confirmations, report.WeekEnd);
+            columnsForTotal.Add(columnData);
+            report.WeeklyColumns.Add(columnData);
+            report.WeeklyColumns.Add(GenerateWeeklyTotalColumn("PRO-TOT", columnsForTotal));
+
+            // Reactives
+            columnData = GenerateWeeklyColumn("REA-CORR", GetReactiveCorrectives(details), confirmations, report.WeekEnd);
+            columnsForTotal.Add(columnData);
+            report.WeeklyColumns.Add(columnData);
+            report.WeeklyColumns.Add(GenerateWeeklyTotalColumn("HEB-TOT", columnsForTotal));
+
+            // Unplanned
+            columnData = GetUnplanned(confirmations, details, mondayScheduleFilter, tuesdayScheduleFilter, wednesdayScheduleFilter, thursdayScheduleFilter,
+                fridayScheduleFilter, weeklySchedule.WeekEnd);
+            columnsForTotal.Add(columnData);
+            report.WeeklyColumns.Add(columnData);
+
+            // Emergencies
+            columnData = GetEmergencies(confirmations, mondayScheduleFilter, tuesdayScheduleFilter, wednesdayScheduleFilter, thursdayScheduleFilter,
+                fridayScheduleFilter, weeklySchedule.WeekEnd);
+            columnsForTotal.Add(columnData);
+            report.WeeklyColumns.Add(columnData);
+
+            // Column for product swtich, add only if site group configuration specifies it
+            SiteGroupPreference productSwitchCfg = siteGroup.Preferences.Where(ps => ps.Name == "ProductSwitchActive").FirstOrDefault();
+            if (productSwitchCfg != null && productSwitchCfg.Value == "True")
+            {
+                IList<string> unitWorkOrders = dataConnector.GetWorkOrdersForSiteGroup(siteGroupId, report.WeekStart, report.WeekEnd);
+                IList<ProductSwitch> productSwitchs = dataConnector.GetRangeProductSwitchs(siteGroupId, report.WeekStart, report.WeekEnd);
+
+                columnData = new KpiReportWeekColumn();
+                columnData.Id = "PS-TOT";
+                columnData.WorkOrdersCount = productSwitchs.Count();
+                columnData.CompletedWorkOrders = productSwitchs.Count(ps => ps.IsDone);
+                columnData.EstimatedHours = productSwitchs.Sum(ps => ps.ProductSwitchEquipments.Sum(pse => pse.PlannedHours * pse.NbOfPersons));
+                columnData.WorkedHours = confirmations.Where(c => unitWorkOrders.Contains(c.WorkOrderId)).Sum(c => c.ActualWork);
+                columnsForTotal.Add(columnData);
+                report.WeeklyColumns.Add(columnData);
+
+                KpiReportDailyColumn dailyProductSwitch = new KpiReportDailyColumn();
+                dailyProductSwitch.Id = "PS_PLANH";
+                dailyProductSwitch.MondayCount = productSwitchs.Where(ps => ps.Date >= report.WeekStart && ps.Date < report.WeekStart.AddDays(1))
+                    .Sum(ps => ps.ProductSwitchEquipments.Sum(pse => pse.PlannedHours * pse.NbOfPersons));
+                dailyProductSwitch.TuesdayCount = productSwitchs.Where(ps => ps.Date >= report.WeekStart.AddDays(1) && ps.Date < report.WeekStart.AddDays(2))
+                    .Sum(ps => ps.ProductSwitchEquipments.Sum(pse => pse.PlannedHours * pse.NbOfPersons));
+                dailyProductSwitch.WednesdayCount = productSwitchs.Where(ps => ps.Date >= report.WeekStart.AddDays(2) && ps.Date < report.WeekStart.AddDays(3))
+                    .Sum(ps => ps.ProductSwitchEquipments.Sum(pse => pse.PlannedHours * pse.NbOfPersons));
+                dailyProductSwitch.ThursdayCount = productSwitchs.Where(ps => ps.Date >= report.WeekStart.AddDays(3) && ps.Date < report.WeekStart.AddDays(4))
+                    .Sum(ps => ps.ProductSwitchEquipments.Sum(pse => pse.PlannedHours * pse.NbOfPersons));
+                dailyProductSwitch.FridayCount = productSwitchs.Where(ps => ps.Date >= report.WeekStart.AddDays(4) && ps.Date < report.WeekStart.AddDays(5))
+                    .Sum(ps => ps.ProductSwitchEquipments.Sum(pse => pse.PlannedHours * pse.NbOfPersons));
+                report.DailyColumns.Add(dailyProductSwitch);
+
+                dailyProductSwitch = new KpiReportDailyColumn();
+                dailyProductSwitch.Id = "PS_WORKH";
+                dailyProductSwitch.MondayCount = confirmations.Where(c => unitWorkOrders.Contains(c.WorkOrderId) &&
+                    c.PostingDate >= report.WeekStart && c.PostingDate < report.WeekStart.AddDays(1)).Sum(c => c.ActualWork);
+                dailyProductSwitch.MondayCount = confirmations.Where(c => unitWorkOrders.Contains(c.WorkOrderId) &&
+                    c.PostingDate >= report.WeekStart.AddDays(1) && c.PostingDate < report.WeekStart.AddDays(2)).Sum(c => c.ActualWork);
+                dailyProductSwitch.MondayCount = confirmations.Where(c => unitWorkOrders.Contains(c.WorkOrderId) &&
+                    c.PostingDate >= report.WeekStart.AddDays(2) && c.PostingDate < report.WeekStart.AddDays(3)).Sum(c => c.ActualWork);
+                dailyProductSwitch.MondayCount = confirmations.Where(c => unitWorkOrders.Contains(c.WorkOrderId) &&
+                    c.PostingDate >= report.WeekStart.AddDays(3) && c.PostingDate < report.WeekStart.AddDays(4)).Sum(c => c.ActualWork);
+                dailyProductSwitch.MondayCount = confirmations.Where(c => unitWorkOrders.Contains(c.WorkOrderId) &&
+                    c.PostingDate >= report.WeekStart.AddDays(4) && c.PostingDate < report.WeekStart.AddDays(5)).Sum(c => c.ActualWork);
+                report.DailyColumns.Add(dailyProductSwitch);
+            }
+
+            // Great total
+            report.WeeklyColumns.Add(GenerateWeeklyTotalColumn("GRT-TOT", columnsForTotal));
+
+            // Rework
+            columnData = GenerateWeeklyColumn("REWORK", GetReworks(details), confirmations, report.WeekEnd);
+            report.WeeklyColumns.Add(columnData);
+
+            // Not ready
+            columnData = GenerateWeeklyColumn("NOT-RDY", GetNotReadys(details), confirmations, report.WeekEnd);
+            report.WeeklyColumns.Add(columnData);
+
+            // Daily schedules
+            KpiReportDailyColumn dailySchedule = GetDailyScheduledColumn(mondayScheduleFilter, tuesdayScheduleFilter, wednesdayScheduleFilter, thursdayScheduleFilter, fridayScheduleFilter, confirmations, report.WeekStart, report.WeekEnd);
+            report.DailyColumns.Add(dailySchedule);
+            report.DailyColumns.Add(GetDailyCompletedColumn(dailySchedule));
+            report.DailyColumns.Add(GetDailyNotDoneColumn(dailySchedule));
+            report.DailyColumns.Add(GetDailyUnplannedColumn(mondayScheduleFilter, tuesdayScheduleFilter, wednesdayScheduleFilter, thursdayScheduleFilter, fridayScheduleFilter, confirmations, report.WeekStart, report.WeekEnd));
+            report.DailyColumns.Add(GetDailyEmergencyColumn(mondayScheduleFilter, tuesdayScheduleFilter, wednesdayScheduleFilter, thursdayScheduleFilter, fridayScheduleFilter, confirmations, report.WeekStart, report.WeekEnd));
+            report.DailyColumns.Add(GetDailyUnplannedHoursColumn(weeklySchedule.WeekStart, mondayScheduleFilter, tuesdayScheduleFilter, wednesdayScheduleFilter,
+                thursdayScheduleFilter, fridayScheduleFilter, confirmations, details));
+            report.DailyColumns.Add(GetDailyEmergencyHoursColumn(weeklySchedule.WeekStart, mondayScheduleFilter, tuesdayScheduleFilter, wednesdayScheduleFilter,
+                thursdayScheduleFilter, fridayScheduleFilter, confirmations));
+
+            report.Differences = GetWorkDifferences(weeklySchedule.WeekStart, weeklySchedule.WeekEnd, details, confirmations, dataConnector);
+
+            DateTime backlogDate = DateHelper.GetWeekEnding(date);
+
+            for (int i = 0; i < 5; i++)
+            {
+                IList<string> backlogWorkOrders = new List<string>();
+                IList<ScheduleBacklog> backlogs = dataConnector.ListDailyBacklogs(siteGroupId, backlogDate, roleFilter, new List<string>());
+                
+                foreach (ScheduleBacklog backlog in backlogs)
+                {
+
+                    if (!backlogWorkOrders.Contains(backlog.WorkOrderId))
+                        backlogWorkOrders.Add(backlog.WorkOrderId);
+                }
+
+                IList<WorkOrder> backlogWorkOrder = dataConnector.ListWorkOrderByIds(backlogWorkOrders);
+
+                //Removing STAN Type workOrder
+                var toRemove = backlogWorkOrder.Where(x => x.Type == "STAN").ToList();
+                backlogWorkOrder = backlogWorkOrder.Where(x => x.Type != "STAN").ToList();
+                foreach(var wo in toRemove)
+                {
+                    backlogs = backlogs.Where(x => x.WorkOrderId != wo.WorkOrderId).ToList();
+                }
+
+                report.WeekCounts.Add(new KpiReportWeekCount()
+                {
+                    Id = i + 1,
+                    WeekStart = DateHelper.GetWeekBeginning(backlogDate),
+                    WeekEnd  = backlogDate,
+                    TotalOpenHours = backlogs.Sum(b => b.OpenHours),
+                    TotalRunningHours = backlogs.Where(b => backlogWorkOrder.Any(bw => bw.WorkOrderId == b.WorkOrderId && bw.SystemConditionId == 1)).Sum(b => b.OpenHours)
+                });
+
+                backlogDate = backlogDate.AddDays(-7);
+            }
+
+            return report;
+        }
+
+        private static KpiReportWeekColumn GenerateWeeklyTotalColumn(string id, IList<KpiReportWeekColumn> columns)
+        {
+            return new KpiReportWeekColumn()
+            {
+                Id = id,
+                WorkOrdersCount = columns.Sum(c => c.WorkOrdersCount),
+                CompletedWorkOrders = columns.Sum(c => c.CompletedWorkOrders),
+                EstimatedHours = columns.Sum(c => c.EstimatedHours),
+                WorkedHours = columns.Sum(c => c.WorkedHours)
+            };
+        }
+
+        private static KpiReportWeekColumn GenerateWeeklyColumn(string id, IList<WeeklyScheduleDetail> details, IList<OrderConfirmation> confirmations, DateTime weekEnd)
+        {
+            // Remove work orders without planned hours on weekdays
+            IList<KpiReportOperationDetail> detailsFilter =
+                details.Where(d => d.WeeklyHours > 0 || d.MondayHours > 0 || d.TuesdayHours > 0 || d.WednesdayHours > 0 || d.ThursdayHours > 0 || d.FridayHours > 0)
+                .Select(d => new KpiReportOperationDetail()
+                {
+                    WorkOrderId = d.WorkOrderId,
+                    OperationId = d.OperationId,
+                    Description = d.Operation.ShortDescription,
+                    Type = d.Operation.WorkOrder.Type,
+                    MaintenanceActivityTypeId = d.Operation.WorkOrder.MaintenanceActivityTypeId,
+                    RoleId = d.Operation.WorkCenter.RoleId,
+                    IsCompleted = (d.Operation.CompleteDate.HasValue && d.Operation.CompleteDate.Value <= weekEnd) || d.Status == WorkOrderManager.STATUS_COMPLETED,
+                    EstimatedHours = d.MondayHours + d.TuesdayHours + d.WednesdayHours + d.ThursdayHours + d.FridayHours,
+                    WorkedHours = CalculWeeklyWorkedHours(d, confirmations)
+                }).OrderBy(d => d.WorkOrderId).ThenBy(d => d.OperationId).ToList();
+
+            return new KpiReportWeekColumn()
+            {
+                Id = id,
+                WorkOrdersCount = detailsFilter.Count,
+                CompletedWorkOrders = detailsFilter.Where(d => d.IsCompleted).Count(),
+                EstimatedHours = detailsFilter.Sum(d => d.EstimatedHours),
+                WorkedHours = detailsFilter.Sum(d => d.WorkedHours),
+                Details = detailsFilter
+            };
+        }
+
+        private static decimal CalculWeeklyWorkedHours(WeeklyScheduleDetail detail, IList<OrderConfirmation> confirmations)
+        {
+            return confirmations.Where(c => c.WorkOrderId == detail.WorkOrderId && c.OperationId == detail.OperationId).Sum(c => c.ActualWork);
+        }
+
+        /// <summary>
+        /// Rework
+        /// </summary>
+        /// <param name="weeklySchedule"></param>
+        /// <returns></returns>
+        private static IList<WeeklyScheduleDetail> GetReworks(IEnumerable<WeeklyScheduleDetail> details)
+        {
+            return details.Where(wsd => wsd.Operation.IsRework).ToList();
+        }
+
+        /// <summary>
+        /// Not ready
+        /// </summary>
+        /// <param name="weeklySchedule"></param>
+        /// <returns></returns>
+        private static IList<WeeklyScheduleDetail> GetNotReadys(IEnumerable<WeeklyScheduleDetail> details)
+        {
+            return details.Where(wsd => wsd.IsNotReady).ToList();
+        }
+
+        /// <summary>
+        /// Proactive - Improvements
+        ///     - Order type: CORR or PROA      Activity Type : MOD
+        ///     - Order type: PROJ              Activity Type : MNT
+        /// </summary>
+        /// <param name="weeklySchedule"></param>
+        /// <returns></returns>
+        private static IList<WeeklyScheduleDetail> GetProactiveImprovements(IEnumerable<WeeklyScheduleDetail> details)
+        {
+            return details.Where(wsd => (((wsd.Operation.WorkOrder.Type == "CORR" || wsd.Operation.WorkOrder.Type == "PROA") && wsd.Operation.WorkOrder.MaintenanceActivityTypeId == "MOD") ||
+                 (wsd.Operation.WorkOrder.Type == "PROJ" && wsd.Operation.WorkOrder.MaintenanceActivityTypeId == "MNT"))).ToList();
+        }
+
+        /// <summary>
+        /// Proactive - Preventive Corrections
+        ///     - Order type: CORR              Activity Type : FRO or SUP or CLN
+        ///     - Order type: SPEC              Activity Type : MNT
+        /// </summary>
+        /// <param name="weeklySchedule"></param>
+        /// <returns></returns>
+        private static IList<WeeklyScheduleDetail> GetProactivePrevCorrections(IEnumerable<WeeklyScheduleDetail> details)
+        {
+            return details.Where(wsd => ((wsd.Operation.WorkOrder.Type == "CORR" && (wsd.Operation.WorkOrder.MaintenanceActivityTypeId == "FRO" ||
+                    wsd.Operation.WorkOrder.MaintenanceActivityTypeId == "SUP" || wsd.Operation.WorkOrder.MaintenanceActivityTypeId == "CLN")) ||
+                 (wsd.Operation.WorkOrder.Type == "SPEC" && wsd.Operation.WorkOrder.MaintenanceActivityTypeId == "MNT"))).ToList();
+        }
+
+        /// <summary>
+        /// Proactive - Preventives
+        ///     - Order type: PROA              Activity Type : PRE or PRD or INS or MNT
+        /// </summary>
+        /// <param name="weeklySchedule"></param>
+        /// <returns></returns>
+        private static IList<WeeklyScheduleDetail> GetProactivePreventives(IEnumerable<WeeklyScheduleDetail> details)
+        {
+            return details.Where(wsd => (wsd.Operation.WorkOrder.Type == "PROA" && (wsd.Operation.WorkOrder.MaintenanceActivityTypeId == "PRE" ||
+                    wsd.Operation.WorkOrder.MaintenanceActivityTypeId == "PRD" || wsd.Operation.WorkOrder.MaintenanceActivityTypeId == "INS" ||
+                    wsd.Operation.WorkOrder.MaintenanceActivityTypeId == "MNT"))).ToList();
+        }
+
+        /// <summary>
+        /// Proactive - Security
+        ///     - Order type: CORR or PROA or PROJ               Activity Type : SAF
+        /// </summary>
+        /// <param name="weeklySchedule"></param>
+        /// <returns></returns>
+        private static IList<WeeklyScheduleDetail> GetProactiveSecurity(IEnumerable<WeeklyScheduleDetail> details)
+        {
+            return details.Where(wsd => ((wsd.Operation.WorkOrder.Type == "CORR" || wsd.Operation.WorkOrder.Type == "PROA" || wsd.Operation.WorkOrder.Type == "PROJ") &&
+                    wsd.Operation.WorkOrder.MaintenanceActivityTypeId == "SAF")).ToList();
+        }
+
+        /// <summary>
+        /// Proactive - Formations
+        ///     - Order type: CORR or PROA              Activity Type : TRN or REL or MTG
+        /// </summary>
+        /// <param name="weeklySchedule"></param>
+        /// <returns></returns>
+        private static IList<WeeklyScheduleDetail> GetProactiveFormations(IEnumerable<WeeklyScheduleDetail> details)
+        {
+            return details.Where(wsd => ((wsd.Operation.WorkOrder.Type == "CORR" || wsd.Operation.WorkOrder.Type == "PROA") &&
+                    (wsd.Operation.WorkOrder.MaintenanceActivityTypeId == "TRN" || wsd.Operation.WorkOrder.MaintenanceActivityTypeId == "REL" ||
+                        wsd.Operation.WorkOrder.MaintenanceActivityTypeId == "MTG"))).ToList();
+        }
+
+        /// <summary>
+        /// Reactive - Correctives
+        ///     - Order type: CORR                      Activity Type : MNT
+        /// </summary>
+        /// <param name="weeklySchedule"></param>
+        /// <returns></returns>
+        private static IList<WeeklyScheduleDetail> GetReactiveCorrectives(IEnumerable<WeeklyScheduleDetail> details)
+        {
+            return details.Where(wsd => (wsd.Operation.WorkOrder.Type == "CORR" && wsd.Operation.WorkOrder.MaintenanceActivityTypeId == "MNT")).ToList();
+        }
+
+        /// <summary>
+        /// 
+        /// </summary>
+        /// <param name="confirmations"></param>
+        /// <param name="mondaySchedule"></param>
+        /// <param name="tuesdaySchedule"></param>
+        /// <param name="wednesdaySchedule"></param>
+        /// <param name="thursdaySchedule"></param>
+        /// <param name="fridaySchedule"></param>
+        /// <param name="weekEnd"></param>
+        /// <returns></returns>
+        private static KpiReportWeekColumn GetUnplanned(IList<OrderConfirmation> confirmations, IEnumerable<WeeklyScheduleDetail> details, IEnumerable<WorkOperation> mondaySchedule,
+            IEnumerable<WorkOperation> tuesdaySchedule, IEnumerable<WorkOperation> wednesdaySchedule, IEnumerable<WorkOperation> thursdaySchedule, IEnumerable<WorkOperation> fridaySchedule,
+            DateTime weekEnd)
+        {
+            KpiReportWeekColumn unplannedColumn = new KpiReportWeekColumn();
+            unplannedColumn.Details = new List<KpiReportOperationDetail>();
+
+            unplannedColumn.Id = "UNPL-TOT";
+
+            GetUnplannedForDay(mondaySchedule, details, unplannedColumn.Details, unplannedColumn, weekEnd);
+            GetUnplannedForDay(tuesdaySchedule, details, unplannedColumn.Details, unplannedColumn, weekEnd);
+            GetUnplannedForDay(wednesdaySchedule, details, unplannedColumn.Details, unplannedColumn, weekEnd);
+            GetUnplannedForDay(thursdaySchedule, details, unplannedColumn.Details, unplannedColumn, weekEnd);
+            GetUnplannedForDay(fridaySchedule, details, unplannedColumn.Details, unplannedColumn, weekEnd);
+
+            foreach (KpiReportOperationDetail detail in unplannedColumn.Details)
+            {
+                detail.WorkedHours = confirmations.Where(c => c.WorkOrderId == detail.WorkOrderId && c.OperationId == detail.OperationId).Sum(c => c.ActualWork);
+                unplannedColumn.WorkedHours += detail.WorkedHours;
+            }
+
+            unplannedColumn.Details = unplannedColumn.Details.OrderBy(d => d.WorkOrderId).ThenBy(d => d.OperationId).ToList();
+
+            return unplannedColumn;
+        }
+
+        /// <summary>
+        /// Unplanned (not in weekly)
+        ///     - Order type: All except BRKD
+        /// </summary>
+        /// <param name="dailyWorkOrders"></param>
+        /// <param name="details"></param>
+        /// <param name="foundWorkOrders"></param>
+        /// <param name="unplannedColumn"></param>
+        /// <param name="weekEnd"></param>
+        private static void GetUnplannedForDay(IEnumerable<WorkOperation> dailyWorkOrders, IEnumerable<WeeklyScheduleDetail> details,
+            IList<KpiReportOperationDetail> foundWorkOrders, KpiReportWeekColumn unplannedColumn, DateTime weekEnd)
+        {
+            IEnumerable<WorkOperation> operations = dailyWorkOrders.Where(dwo => dwo.Type != "BRKD");
+
+            foreach (WorkOperation operation in operations)
+            {
+                KeyValuePair<string, string> key = new KeyValuePair<string, string>(operation.WorkOrderId, operation.OperationId);
+
+                if (!foundWorkOrders.Any(d => d.WorkOrderId == operation.WorkOrderId && d.OperationId == operation.OperationId) &&
+                    !details.Any(d => d.WorkOrderId == operation.WorkOrderId && d.OperationId == operation.OperationId))
+                {
+                    unplannedColumn.WorkOrdersCount++;
+                    unplannedColumn.EstimatedHours += operation.PlannedHours;
+
+                    bool isCompleted = (operation.CompleteDateOperation.HasValue && operation.CompleteDateOperation.Value <= weekEnd) ||
+                        (operation.WeeklySchedule != null && operation.WeeklySchedule.Status == WorkOrderManager.STATUS_COMPLETED);
+                    if (isCompleted)
+                        unplannedColumn.CompletedWorkOrders++;
+
+                    foundWorkOrders.Add(new KpiReportOperationDetail()
+                    {
+                        WorkOrderId = operation.WorkOrderId,
+                        OperationId = operation.OperationId,
+                        Description = operation.ShortDescriptionOperation,
+                        Type = operation.Type,
+                        MaintenanceActivityTypeId = operation.MaintenanceActivityTypeId,
+                        RoleId = operation.RoleId,
+                        IsCompleted = isCompleted,
+                        EstimatedHours = operation.PlannedHours
+                    });
+                }
+            }
+        }
+
+        /// <summary>
+        /// 
+        /// </summary>
+        /// <param name="confirmations"></param>
+        /// <param name="mondaySchedule"></param>
+        /// <param name="tuesdaySchedule"></param>
+        /// <param name="wednesdaySchedule"></param>
+        /// <param name="thursdaySchedule"></param>
+        /// <param name="fridaySchedule"></param>
+        /// <param name="weekEnd"></param>
+        /// <returns></returns>
+        private static KpiReportWeekColumn GetEmergencies(IList<OrderConfirmation> confirmations, IEnumerable<WorkOperation> mondaySchedule, IEnumerable<WorkOperation> tuesdaySchedule,
+            IEnumerable<WorkOperation> wednesdaySchedule, IEnumerable<WorkOperation> thursdaySchedule, IEnumerable<WorkOperation> fridaySchedule, DateTime weekEnd)
+        {
+            KpiReportWeekColumn emergencyColumn = new KpiReportWeekColumn();
+            emergencyColumn.Details = new List<KpiReportOperationDetail>();
+
+            emergencyColumn.Id = "EMER-TOT";
+
+            GetEmergenciesForDay(mondaySchedule, emergencyColumn.Details, emergencyColumn, weekEnd);
+            GetEmergenciesForDay(tuesdaySchedule, emergencyColumn.Details, emergencyColumn, weekEnd);
+            GetEmergenciesForDay(wednesdaySchedule, emergencyColumn.Details, emergencyColumn, weekEnd);
+            GetEmergenciesForDay(thursdaySchedule, emergencyColumn.Details, emergencyColumn, weekEnd);
+            GetEmergenciesForDay(fridaySchedule, emergencyColumn.Details, emergencyColumn, weekEnd);
+
+            foreach (KpiReportOperationDetail detail in emergencyColumn.Details)
+            {
+                detail.WorkedHours = confirmations.Where(c => c.WorkOrderId == detail.WorkOrderId && c.OperationId == detail.OperationId).Sum(c => c.ActualWork);
+                emergencyColumn.WorkedHours += detail.WorkedHours;
+            }
+
+            emergencyColumn.Details = emergencyColumn.Details.OrderBy(d => d.WorkOrderId).ThenBy(d => d.OperationId).ToList();
+
+            return emergencyColumn;
+        }
+
+        /// <summary>
+        /// 
+        /// </summary>
+        /// <param name="dailyWorkOrders"></param>
+        /// <param name="foundWorkOrders"></param>
+        /// <param name="emergencyColumn"></param>
+        /// <param name="weekEnd"></param>
+        private static void GetEmergenciesForDay(IEnumerable<WorkOperation> dailyWorkOrders, IList<KpiReportOperationDetail> foundWorkOrders,
+            KpiReportWeekColumn emergencyColumn, DateTime weekEnd)
+        {
+            IEnumerable<WorkOperation> operations = dailyWorkOrders.Where(dwo => dwo.Type == "BRKD");
+
+            foreach (WorkOperation operation in operations)
+            {
+                KeyValuePair<string, string> key = new KeyValuePair<string, string>(operation.WorkOrderId, operation.OperationId);
+
+                if (!foundWorkOrders.Any(d => d.WorkOrderId == operation.WorkOrderId && d.OperationId == operation.OperationId))
+                {
+                    emergencyColumn.WorkOrdersCount++;
+                    emergencyColumn.EstimatedHours += operation.PlannedHours;
+
+                    bool isCompleted = (operation.CompleteDateOperation.HasValue && operation.CompleteDateOperation.Value <= weekEnd) ||
+                        (operation.WeeklySchedule != null && operation.WeeklySchedule.Status == WorkOrderManager.STATUS_COMPLETED);
+                    if (isCompleted)
+                        emergencyColumn.CompletedWorkOrders++;
+
+                    foundWorkOrders.Add(new KpiReportOperationDetail()
+                    {
+                        WorkOrderId = operation.WorkOrderId,
+                        OperationId = operation.OperationId,
+                        Description = operation.ShortDescriptionOperation,
+                        Type = operation.Type,
+                        MaintenanceActivityTypeId = operation.MaintenanceActivityTypeId,
+                        RoleId = operation.RoleId,
+                        IsCompleted = isCompleted,
+                        EstimatedHours = operation.PlannedHours
+                    });
+                }
+            }
+        }
+
+        /// <summary>
+        /// 
+        /// </summary>
+        /// <param name="mondaySchedule"></param>
+        /// <param name="tuesdaySchedule"></param>
+        /// <param name="wednesdaySchedule"></param>
+        /// <param name="thursdaySchedule"></param>
+        /// <param name="fridaySchedule"></param>
+        /// <returns></returns>
+        private static KpiReportDailyColumn GetDailyScheduledColumn(IEnumerable<WorkOperation> mondaySchedule, IEnumerable<WorkOperation> tuesdaySchedule,
+            IEnumerable<WorkOperation> wednesdaySchedule, IEnumerable<WorkOperation> thursdaySchedule, IEnumerable<WorkOperation> fridaySchedule,
+            IList<OrderConfirmation> confirmations, DateTime weekStart, DateTime weekEnd)
+        {
+            KpiReportDailyColumn column = new KpiReportDailyColumn();
+
+            column.Id = "WO_PLAN";
+
+            column.MondayDetails = GetDailyScheduled(mondaySchedule, confirmations, weekStart, weekEnd);
+            column.MondayCount = column.MondayDetails.Count;
+            column.TuesdayDetails = GetDailyScheduled(tuesdaySchedule, confirmations, weekStart.AddDays(1), weekEnd);
+            column.TuesdayCount = column.TuesdayDetails.Count;
+            column.WednesdayDetails = GetDailyScheduled(wednesdaySchedule, confirmations, weekStart.AddDays(2), weekEnd);
+            column.WednesdayCount = column.WednesdayDetails.Count;
+            column.ThursdayDetails = GetDailyScheduled(thursdaySchedule, confirmations, weekStart.AddDays(3), weekEnd);
+            column.ThursdayCount = column.ThursdayDetails.Count;
+            column.FridayDetails = GetDailyScheduled(fridaySchedule, confirmations, weekStart.AddDays(4), weekEnd);
+            column.FridayCount = column.FridayDetails.Count;
+
+            return column;
+        }
+
+        /// <summary>
+        /// 
+        /// </summary>
+        /// <param name="schedule"></param>
+        /// <returns></returns>
+        private static IList<KpiReportOperationDetail> GetDailyScheduled(IEnumerable<WorkOperation> schedule, IList<OrderConfirmation> confirmations, DateTime weekDay, DateTime weekEnd)
+        {
+            return schedule.Where(s => s.DailySchedule != null && s.Type != "BRKD" && s.WeeklySchedule != null)
+                .Select(s => new KpiReportOperationDetail()
+                {
+                    WorkOrderId = s.WorkOrderId,
+                    OperationId = s.OperationId,
+                    Description = s.ShortDescriptionOperation,
+                    Type = s.Type,
+                    MaintenanceActivityTypeId = s.MaintenanceActivityTypeId,
+                    RoleId = s.RoleId,
+                    IsCompleted = (s.CompleteDateOperation.HasValue && s.CompleteDateOperation.Value <= weekEnd) ||
+                        (s.WeeklySchedule != null && s.WeeklySchedule.Status == WorkOrderManager.STATUS_COMPLETED),
+                    IsDone = (s.DailySchedule?.IsDone).GetValueOrDefault(),
+                    EstimatedHours = GetDayOfWeekHours(s.WeeklySchedule, weekDay),
+                    WorkedHours = confirmations.Where(c => c.WorkOrderId == s.WorkOrderId && c.OperationId == s.OperationId &&
+                        c.PostingDate >= weekDay && c.PostingDate < weekDay.AddDays(1)).Sum(c => c.ActualWork)
+                }).ToList();
+        }
+
+        private static decimal GetDayOfWeekHours(WeeklyScheduleDetail schedule, DateTime dayOfWeek)
+        {
+            switch (dayOfWeek.DayOfWeek)
+            {
+                case DayOfWeek.Monday:
+                    return schedule.MondayHours;
+                case DayOfWeek.Tuesday:
+                    return schedule.TuesdayHours;
+                case DayOfWeek.Wednesday:
+                    return schedule.WednesdayHours;
+                case DayOfWeek.Thursday:
+                    return schedule.ThursdayHours;
+                case DayOfWeek.Friday:
+                    return schedule.FridayHours;
+                case DayOfWeek.Saturday:
+                    return schedule.SaturdayHours;
+                case DayOfWeek.Sunday:
+                    return schedule.SundayHours;
+            }
+
+            return 0;
+        }
+
+        /// <summary>
+        /// 
+        /// </summary>
+        /// <param name="dailySchedule"></param>
+        /// <returns></returns>
+        private static KpiReportDailyColumn GetDailyCompletedColumn(KpiReportDailyColumn dailySchedule)
+        {
+            KpiReportDailyColumn column = new KpiReportDailyColumn();
+
+            column.Id = "WO_COMPL";
+
+            column.MondayDetails = dailySchedule.MondayDetails.Where(d => d.IsCompleted || d.IsDone).ToList();
+            column.MondayCount = column.MondayDetails.Count;
+            column.TuesdayDetails = dailySchedule.TuesdayDetails.Where(d => d.IsCompleted || d.IsDone).ToList();
+            column.TuesdayCount = column.TuesdayDetails.Count;
+            column.WednesdayDetails = dailySchedule.WednesdayDetails.Where(d => d.IsCompleted || d.IsDone).ToList();
+            column.WednesdayCount = column.WednesdayDetails.Count;
+            column.ThursdayDetails = dailySchedule.ThursdayDetails.Where(d => d.IsCompleted || d.IsDone).ToList();
+            column.ThursdayCount = column.ThursdayDetails.Count;
+            column.FridayDetails = dailySchedule.FridayDetails.Where(d => d.IsCompleted || d.IsDone).ToList();
+            column.FridayCount = column.FridayDetails.Count;
+
+            return column;
+        }
+
+        /// <summary>
+        /// 
+        /// </summary>
+        /// <param name="mondaySchedule"></param>
+        /// <param name="tuesdaySchedule"></param>
+        /// <param name="wednesdaySchedule"></param>
+        /// <param name="thursdaySchedule"></param>
+        /// <param name="fridaySchedule"></param>
+        /// <returns></returns>
+        private static KpiReportDailyColumn GetDailyNotDoneColumn(KpiReportDailyColumn dailySchedule)
+        {
+            KpiReportDailyColumn column = new KpiReportDailyColumn();
+
+            column.Id = "WO_NOTD";
+
+            column.MondayDetails = dailySchedule.MondayDetails.Where(d => !d.IsCompleted && !d.IsDone).ToList();
+            column.MondayCount = column.MondayDetails.Count;
+            column.TuesdayDetails = dailySchedule.TuesdayDetails.Where(d => !d.IsCompleted && !d.IsDone).ToList();
+            column.TuesdayCount = column.TuesdayDetails.Count;
+            column.WednesdayDetails = dailySchedule.WednesdayDetails.Where(d => !d.IsCompleted && !d.IsDone).ToList();
+            column.WednesdayCount = column.WednesdayDetails.Count;
+            column.ThursdayDetails = dailySchedule.ThursdayDetails.Where(d => !d.IsCompleted && !d.IsDone).ToList();
+            column.ThursdayCount = column.ThursdayDetails.Count;
+            column.FridayDetails = dailySchedule.FridayDetails.Where(d => !d.IsCompleted && !d.IsDone).ToList();
+            column.FridayCount = column.FridayDetails.Count;
+
+            return column;
+        }
+
+        /// <summary>
+        /// 
+        /// </summary>
+        /// <param name="mondaySchedule"></param>
+        /// <param name="tuesdaySchedule"></param>
+        /// <param name="wednesdaySchedule"></param>
+        /// <param name="thursdaySchedule"></param>
+        /// <param name="fridaySchedule"></param>
+        /// <returns></returns>
+        private static KpiReportDailyColumn GetDailyUnplannedColumn(IEnumerable<WorkOperation> mondaySchedule, IEnumerable<WorkOperation> tuesdaySchedule,
+            IEnumerable<WorkOperation> wednesdaySchedule, IEnumerable<WorkOperation> thursdaySchedule, IEnumerable<WorkOperation> fridaySchedule,
+            IList<OrderConfirmation> confirmations, DateTime weekStart, DateTime weekEnd)
+        {
+            KpiReportDailyColumn column = new KpiReportDailyColumn();
+
+            column.Id = "WO_UNPL";
+
+            column.MondayDetails = GetDailyUnplanned(mondaySchedule, confirmations, weekStart, weekEnd);
+            column.MondayCount = column.MondayDetails.Count;
+            column.TuesdayDetails = GetDailyUnplanned(tuesdaySchedule, confirmations, weekStart.AddDays(1), weekEnd);
+            column.TuesdayCount = column.TuesdayDetails.Count;
+            column.WednesdayDetails = GetDailyUnplanned(wednesdaySchedule, confirmations, weekStart.AddDays(2), weekEnd);
+            column.WednesdayCount = column.WednesdayDetails.Count;
+            column.ThursdayDetails = GetDailyUnplanned(thursdaySchedule, confirmations, weekStart.AddDays(3), weekEnd);
+            column.ThursdayCount = column.ThursdayDetails.Count;
+            column.FridayDetails = GetDailyUnplanned(fridaySchedule, confirmations, weekStart.AddDays(4), weekEnd);
+            column.FridayCount = column.FridayDetails.Count;
+
+            return column;
+        }
+
+        /// <summary>
+        /// 
+        /// </summary>
+        /// <param name="schedule"></param>
+        /// <param name="details"></param>
+        /// <param name="confirmations"></param>
+        /// <param name="weekDay"></param>
+        /// <param name="weekEnd"></param>
+        /// <returns></returns>
+        private static IList<KpiReportOperationDetail> GetDailyUnplanned(IEnumerable<WorkOperation> schedule,
+            IList<OrderConfirmation> confirmations, DateTime weekDay, DateTime weekEnd)
+        {
+            return schedule.Where(s => s.DailySchedule != null && s.Type != "BRKD" && s.WeeklySchedule == null)
+                .Select(s => new KpiReportOperationDetail()
+                {
+                    WorkOrderId = s.WorkOrderId,
+                    OperationId = s.OperationId,
+                    Description = s.ShortDescriptionOperation,
+                    Type = s.Type,
+                    MaintenanceActivityTypeId = s.MaintenanceActivityTypeId,
+                    RoleId = s.RoleId,
+                    IsCompleted = (s.CompleteDateOperation.HasValue && s.CompleteDateOperation.Value <= weekEnd),
+                    IsDone = (s.DailySchedule?.IsDone).GetValueOrDefault(),
+                    EstimatedHours = s.PlannedHours,
+                    WorkedHours = confirmations.Where(c => c.WorkOrderId == s.WorkOrderId && c.OperationId == s.OperationId &&
+                        c.PostingDate >= weekDay && c.PostingDate < weekDay.AddDays(1)).Sum(c => c.ActualWork)
+                }).ToList();
+        }
+
+        /// <summary>
+        /// 
+        /// </summary>
+        /// <param name="mondaySchedule"></param>
+        /// <param name="tuesdaySchedule"></param>
+        /// <param name="wednesdaySchedule"></param>
+        /// <param name="thursdaySchedule"></param>
+        /// <param name="fridaySchedule"></param>
+        /// <returns></returns>
+        private static KpiReportDailyColumn GetDailyEmergencyColumn(IEnumerable<WorkOperation> mondaySchedule, IEnumerable<WorkOperation> tuesdaySchedule,
+            IEnumerable<WorkOperation> wednesdaySchedule, IEnumerable<WorkOperation> thursdaySchedule, IEnumerable<WorkOperation> fridaySchedule,
+            IList<OrderConfirmation> confirmations, DateTime weekStart, DateTime weekEnd)
+        {
+            KpiReportDailyColumn column = new KpiReportDailyColumn();
+
+            column.Id = "WO_EMER";
+
+            column.MondayDetails = GetDailyEmergency(mondaySchedule, confirmations, weekStart, weekEnd);
+            column.MondayCount = column.MondayDetails.Count;
+            column.TuesdayDetails = GetDailyEmergency(tuesdaySchedule, confirmations, weekStart.AddDays(1), weekEnd);
+            column.TuesdayCount = column.TuesdayDetails.Count;
+            column.WednesdayDetails = GetDailyEmergency(wednesdaySchedule, confirmations, weekStart.AddDays(2), weekEnd);
+            column.WednesdayCount = column.WednesdayDetails.Count;
+            column.ThursdayDetails = GetDailyEmergency(thursdaySchedule, confirmations, weekStart.AddDays(3), weekEnd);
+            column.ThursdayCount = column.ThursdayDetails.Count;
+            column.FridayDetails = GetDailyEmergency(fridaySchedule, confirmations, weekStart.AddDays(4), weekEnd);
+            column.FridayCount = column.FridayDetails.Count;
+
+            return column;
+        }
+
+        /// <summary>
+        /// 
+        /// </summary>
+        /// <param name="schedule"></param>
+        /// <returns></returns>
+        private static IList<KpiReportOperationDetail> GetDailyEmergency(IEnumerable<WorkOperation> schedule, IList<OrderConfirmation> confirmations, DateTime weekDay, DateTime weekEnd)
+        {
+            return schedule.Where(s => s.DailySchedule != null && s.Type == "BRKD")
+                .Select(s => new KpiReportOperationDetail()
+                {
+                    WorkOrderId = s.WorkOrderId,
+                    OperationId = s.OperationId,
+                    Description = s.ShortDescriptionOperation,
+                    Type = s.Type,
+                    MaintenanceActivityTypeId = s.MaintenanceActivityTypeId,
+                    RoleId = s.RoleId,
+                    IsCompleted = (s.CompleteDateOperation.HasValue && s.CompleteDateOperation.Value <= weekEnd),
+                    IsDone = (s.DailySchedule?.IsDone).GetValueOrDefault(),
+                    EstimatedHours = s.PlannedHours,
+                    WorkedHours = confirmations.Where(c => c.WorkOrderId == s.WorkOrderId && c.OperationId == s.OperationId &&
+                        c.PostingDate >= weekDay && c.PostingDate < weekDay.AddDays(1)).Sum(c => c.ActualWork)
+                }).ToList();
+        }
+
+        /// <summary>
+        /// 
+        /// </summary>
+        /// <param name="weekStart"></param>
+        /// <param name="mondaySchedule"></param>
+        /// <param name="tuesdaySchedule"></param>
+        /// <param name="wednesdaySchedule"></param>
+        /// <param name="thursdaySchedule"></param>
+        /// <param name="fridaySchedule"></param>
+        /// <param name="confirmations"></param>
+        /// <param name="details"></param>
+        /// <returns></returns>
+        private static KpiReportDailyColumn GetDailyUnplannedHoursColumn(DateTime weekStart, IEnumerable<WorkOperation> mondaySchedule, IEnumerable<WorkOperation> tuesdaySchedule,
+            IEnumerable<WorkOperation> wednesdaySchedule, IEnumerable<WorkOperation> thursdaySchedule, IEnumerable<WorkOperation> fridaySchedule,
+            IList<OrderConfirmation> confirmations, IEnumerable<WeeklyScheduleDetail> details)
+        {
+            KpiReportDailyColumn column = new KpiReportDailyColumn();
+
+            column.Id = "HR_UNPL";
+
+            column.MondayCount = GetDailyUnplannedHours(weekStart, mondaySchedule, details, confirmations);
+            column.TuesdayCount = GetDailyUnplannedHours(weekStart.AddDays(1), tuesdaySchedule, details, confirmations);
+            column.WednesdayCount = GetDailyUnplannedHours(weekStart.AddDays(2), wednesdaySchedule, details, confirmations);
+            column.ThursdayCount = GetDailyUnplannedHours(weekStart.AddDays(3), thursdaySchedule, details, confirmations);
+            column.FridayCount = GetDailyUnplannedHours(weekStart.AddDays(4), fridaySchedule, details, confirmations);
+
+            return column;
+        }
+
+        /// <summary>
+        /// 
+        /// </summary>
+        /// <param name="date"></param>
+        /// <param name="schedule"></param>
+        /// <param name="details"></param>
+        /// <param name="confirmations"></param>
+        /// <returns></returns>
+        private static decimal GetDailyUnplannedHours(DateTime date, IEnumerable<WorkOperation> schedule, IEnumerable<WeeklyScheduleDetail> details, IList<OrderConfirmation> confirmations)
+        {
+            IEnumerable<WorkOperation> operations = schedule.Where(s => s.DailySchedule != null && s.Type != "BRKD" &&
+                details.Count(d => d.WorkOrderId == s.WorkOrderId && d.OperationId == s.OperationId) == 0);
+
+            decimal total = 0;
+            DateTime fromTime = date.Date;
+            DateTime toTime = date.Date.AddDays(1).AddSeconds(-1);
+
+            foreach (WorkOperation operation in operations)
+                total += confirmations.Where(c => c.WorkOrderId == operation.WorkOrderId && c.OperationId == operation.OperationId &&
+                    c.PostingDate >= fromTime && c.PostingDate <= toTime).Sum(c => c.ActualWork);
+
+            return total;
+        }
+
+        /// <summary>
+        /// 
+        /// </summary>
+        /// <param name="weekStart"></param>
+        /// <param name="mondaySchedule"></param>
+        /// <param name="tuesdaySchedule"></param>
+        /// <param name="wednesdaySchedule"></param>
+        /// <param name="thursdaySchedule"></param>
+        /// <param name="fridaySchedule"></param>
+        /// <param name="confirmations"></param>
+        /// <returns></returns>
+        private static KpiReportDailyColumn GetDailyEmergencyHoursColumn(DateTime weekStart, IEnumerable<WorkOperation> mondaySchedule, IEnumerable<WorkOperation> tuesdaySchedule,
+            IEnumerable<WorkOperation> wednesdaySchedule, IEnumerable<WorkOperation> thursdaySchedule, IEnumerable<WorkOperation> fridaySchedule, IList<OrderConfirmation> confirmations)
+        {
+            KpiReportDailyColumn column = new KpiReportDailyColumn();
+
+            column.Id = "HR_EMER";
+
+            column.MondayCount = GetDailyEmergencyHours(weekStart, mondaySchedule, confirmations);
+            column.TuesdayCount = GetDailyEmergencyHours(weekStart.AddDays(1), tuesdaySchedule, confirmations);
+            column.WednesdayCount = GetDailyEmergencyHours(weekStart.AddDays(2), wednesdaySchedule, confirmations);
+            column.ThursdayCount = GetDailyEmergencyHours(weekStart.AddDays(3), thursdaySchedule, confirmations);
+            column.FridayCount = GetDailyEmergencyHours(weekStart.AddDays(4), fridaySchedule, confirmations);
+
+            return column;
+        }
+
+        /// <summary>
+        /// 
+        /// </summary>
+        /// <param name="date"></param>
+        /// <param name="schedule"></param>
+        /// <param name="confirmations"></param>
+        /// <returns></returns>
+        private static decimal GetDailyEmergencyHours(DateTime date, IEnumerable<WorkOperation> schedule, IList<OrderConfirmation> confirmations)
+        {
+            IEnumerable<WorkOperation> operations = schedule.Where(s => s.DailySchedule != null && s.Type == "BRKD");
+
+            decimal total = 0;
+            DateTime fromTime = date.Date;
+            DateTime toTime = date.Date.AddDays(1).AddSeconds(-1);
+
+            foreach (WorkOperation operation in operations)
+                total += confirmations.Where(c => c.WorkOrderId == operation.WorkOrderId && c.OperationId == operation.OperationId &&
+                    c.PostingDate >= fromTime && c.PostingDate <= toTime).Sum(c => c.ActualWork);
+
+            return total;
+        }
+
+        private static IList<KpiReportDiffData> GetWorkDifferences(DateTime weekStart, DateTime weekEnd, IEnumerable<WeeklyScheduleDetail> details,
+            IList<OrderConfirmation> confirmations, ISqlServerConnector dataConnector)
+        {
+            IList<KpiReportDiffData> differences = new List<KpiReportDiffData>();
+
+            foreach (WeeklyScheduleDetail detail in details)
+            {
+                // Ignore when no hours were planned, no hours worked or the operation wasn't completed on this week
+                if (detail.Operation.PlannedHours > 0 &&
+                    ((detail.Operation.CompleteDate.HasValue && detail.Operation.CompleteDate.Value <= weekEnd) || detail.Status == WorkOrderManager.STATUS_COMPLETED))
+                {
+                    decimal workedHours = dataConnector.GetOrderConfirmationsFor(detail.WorkOrderId, detail.OperationId,
+                        detail.Status == WorkOrderManager.STATUS_COMPLETED ? weekStart : (DateTime?)null, weekEnd).Sum(c => c.ActualWork);
+
+                    if (workedHours != 0)
+                    {
+                        KpiReportDiffData difference = new KpiReportDiffData();
+
+                        difference.Id = detail.WorkOrderId + "-" + detail.OperationId;
+                        if (workedHours == detail.Operation.PlannedHours)
+                            difference.Difference = 0;
+                        else if (workedHours < detail.Operation.PlannedHours)
+                            difference.Difference = ((workedHours - detail.Operation.PlannedHours) * 100) / workedHours;
+                        else
+                            difference.Difference = ((workedHours - detail.Operation.PlannedHours) * 100) / detail.Operation.PlannedHours;
+
+                        difference.Detail = new KpiReportOperationDetail()
+                        {
+                            WorkOrderId = detail.WorkOrderId,
+                            OperationId = detail.OperationId,
+                            Description = detail.Operation.ShortDescription,
+                            Type = detail.Operation.WorkOrder.Type,
+                            RoleId = detail.Operation.WorkCenter?.RoleId,
+                            MaintenanceActivityTypeId = detail.Operation.WorkOrder.MaintenanceActivityTypeId,
+                            IsCompleted = (detail.Operation.CompleteDate.HasValue && detail.Operation.CompleteDate.Value <= weekEnd) || detail.Status == WorkOrderManager.STATUS_COMPLETED,
+                            EstimatedHours = detail.Operation.PlannedHours,
+                            WorkedHours = workedHours
+                        };
+
+                        differences.Add(difference);
+                    }
+                }
+            }
+
+            return differences;
+        }
+    }
+}
